@@ -1,47 +1,62 @@
 import cv2
 import pyttsx3
-import threading
-import time
+import speech_recognition as sr
 import sounddevice as sd
 import numpy as np
-from scipy.io.wavfile import write
+import scipy.io.wavfile as wav
+import threading
+import time
 from ultralytics import YOLO
-import speech_recognition as sr
 
-# Load YOLOv8 model
+# Initialize YOLO model
 model = YOLO("yolov8n.pt")
 
-# Initialize Text-to-Speech (TTS)
+# Initialize TTS engine
 engine = pyttsx3.init()
 engine.setProperty("rate", 170)
 
-# Default language
-language_mode = 'en'
+# Language configuration
+LANGUAGE = 'en'
+MODE = 'switch'
 
-# Text-to-Speech with language control
+# Voice speaking
 def speak(text):
-    global language_mode
-    print(f"[AI]: {text}")
-    if language_mode == 'hi':
-        hindi_map = {
-            "Obstacle on the left. Move right.": "बाएं रुकावट है, दाईं ओर जाएं।",
-            "Obstacle on the right. Move left.": "दाएं रुकावट है, बाईं ओर जाएं।",
-            "Obstacle ahead. Stop.": "आगे रुकावट है, रुक जाएं।",
-            "Path clear. Move forward.": "रास्ता साफ है, आगे बढ़ें।",
-            "Hey! It's your AI guiding you on your path.": "नमस्ते! यह आपका एआई है जो आपके रास्ते में मदद कर रहा है।",
-            "Say help for one-time guidance or switch for continuous help.": "एक बार सहायता के लिए हेल्प बोलें या निरंतर सहायता के लिए स्विच बोलें।",
-            "Please say english or hindi to choose your language.": "कृपया अपनी भाषा चुनने के लिए इंग्लिश या हिंदी बोलें।"
-        }
-        text = hindi_map.get(text, text)
-    threading.Thread(target=lambda: engine.say(text) or engine.runAndWait()).start()
+    print("SPEAK:", text)
+    engine.say(text)
+    engine.runAndWait()
 
-# Threaded Video Capture
+# Listen to command via microphone without pyaudio
+def listen_command(prompt="Say something"):
+    speak(prompt)
+    print(prompt)
+
+    fs = 16000
+    duration = 4
+
+    try:
+        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
+        sd.wait()
+
+        wav.write("temp.wav", fs, recording)
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile("temp.wav") as source:
+            audio = recognizer.record(source)
+
+        command = recognizer.recognize_google(audio).lower()
+        print(f"RECOGNIZED: {command}")
+        return command
+    except Exception as e:
+        print(f"Voice recognition failed: {e}")
+        return input("Voice failed, type instead: ").lower()
+
+# Video capture thread
 class VideoCaptureThread:
-    def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src)
+    def __init__(self, source=0):
+        self.cap = cv2.VideoCapture(source)
         self.ret, self.frame = self.cap.read()
         self.running = True
-        self.thread = threading.Thread(target=self.update, args=())
+        self.thread = threading.Thread(target=self.update)
         self.thread.start()
 
     def update(self):
@@ -56,117 +71,112 @@ class VideoCaptureThread:
         self.thread.join()
         self.cap.release()
 
-# Detection and guidance
-def detect_and_navigate(frame):
+# Object detection logic
+def detect_objects(frame):
     results = model(frame, verbose=False)
-    detected_objects = []
+    detected = []
 
     for result in results:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             class_id = int(box.cls[0])
             label = model.names[class_id]
-            center_x = (x1 + x2) // 2
-            detected_objects.append(center_x)
-
+            detected.append((label, x1, x2))
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return frame, detected
 
-    width = frame.shape[1]
-    left = sum(1 for x in detected_objects if x < width // 3)
-    right = sum(1 for x in detected_objects if x > 2 * width // 3)
-    center = len(detected_objects) - left - right
+# Navigation logic
+def get_navigation(objects, frame_width):
+    left = sum(1 for o in objects if o[1] < frame_width // 3)
+    right = sum(1 for o in objects if o[2] > 2 * (frame_width // 3))
+    center = sum(1 for o in objects if frame_width // 3 <= o[1] <= 2 * (frame_width // 3))
 
-    if center > 0:
-        message = "Obstacle ahead. Stop."
-    elif left > right:
-        message = "Obstacle on the left. Move right."
-    elif right > left:
-        message = "Obstacle on the right. Move left."
+    if left == 0 and right == 0 and center == 0:
+        return ("Path is clear. Move forward.",
+                "रास्ता साफ है। आगे बढ़ें।")
+    elif center > 0 and left == 0 and right == 0:
+        return ("Obstacle ahead. Please stop.",
+                "सामने बाधा है। कृपया रुकें।")
+    elif left == 0:
+        return ("Obstacle on right. Move left.",
+                "दाईं ओर बाधा है। बाईं ओर जाएं।")
+    elif right == 0:
+        return ("Obstacle on left. Move right.",
+                "बाईं ओर बाधा है। दाईं ओर जाएं।")
     else:
-        message = "Path clear. Move forward."
+        return ("Obstacle in all directions. Please stop.",
+                "हर दिशा में बाधा है। कृपया रुकें।")
 
-    speak(message)
-    return frame, message
+# Help mode: capture and give one-time guidance
+def help_mode(frame):
+    frame = cv2.resize(frame, (320, 240))
+    frame, detected = detect_objects(frame)
+    nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
+    speak(nav_eng if LANGUAGE == 'en' else nav_hin)
+    cv2.putText(frame, nav_eng if LANGUAGE == 'en' else nav_hin, (5, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    cv2.imshow("AI Glasses - Help Mode", frame)
+    cv2.waitKey(5000)
+    cv2.destroyWindow("AI Glasses - Help Mode")
 
-# Voice command listener using sounddevice
-def listen_command(prompt=""):
-    if prompt:
-        speak(prompt)
-    duration = 3  # seconds
-    samplerate = 44100  # Hz
-    print("Listening...")
-    audio_data = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16')
-    sd.wait()
-    write("command.wav", samplerate, audio_data)
-    
-    recognizer = sr.Recognizer()
-    with sr.AudioFile("command.wav") as source:
-        audio = recognizer.record(source)
-    try:
-        command = recognizer.recognize_google(audio).lower()
-        print(f"[Voice Command]: {command}")
-        return command
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError:
-        return ""
+# Dynamic switch mode
+def switch_mode():
+    stream = VideoCaptureThread()
+    last_spoken = ""
+    while True:
+        ret, frame = stream.read()
+        if not ret:
+            break
 
-# Main function
+        frame = cv2.resize(frame, (320, 240))
+        frame, detected = detect_objects(frame)
+        nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
+        text_to_speak = nav_eng if LANGUAGE == 'en' else nav_hin
+
+        if text_to_speak != last_spoken:
+            last_spoken = text_to_speak
+            threading.Thread(target=speak, args=(text_to_speak,)).start()
+
+        cv2.putText(frame, text_to_speak, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        cv2.imshow("AI Glasses - Switch Mode", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    stream.stop()
+    cv2.destroyAllWindows()
+
+# Main program
 def main():
-    global language_mode
-    # Step 1: Ask for language
-    while True:
-        lang_input = listen_command("Please say english or hindi to choose your language.")
-        if "hindi" in lang_input:
-            language_mode = 'hi'
-            speak("आपने हिंदी चुनी है।")
-            break
-        elif "english" in lang_input:
-            language_mode = 'en'
-            speak("You have chosen English.")
-            break
+    global LANGUAGE, MODE
 
-    # Step 2: Ask for mode
-    speak("Hey! It's your AI guiding you on your path.")
-    while True:
-        mode_input = listen_command("Say help for one-time guidance or switch for continuous help.")
-        if "help" in mode_input:
-            mode = "help"
-            break
-        elif "switch" in mode_input:
-            mode = "switch"
-            break
+    lang_input = listen_command("Please say English or Hindi to choose your language.")
+    if "hindi" in lang_input:
+        LANGUAGE = 'hi'
+    else:
+        LANGUAGE = 'en'
+    speak("You selected Hindi." if LANGUAGE == 'hi' else "You selected English.")
 
-    cap = VideoCaptureThread(0)
+    mode_input = listen_command("Please say help or switch to choose your mode.")
+    if "help" in mode_input:
+        MODE = 'help'
+    else:
+        MODE = 'switch'
+    speak("Help mode activated." if MODE == 'help' else "Switch mode activated.")
 
-    if mode == "help":
-        time.sleep(1)
+    # Start guidance
+    speak("Hey! It's your AI guiding you to your path.")
+    if MODE == 'help':
+        cap = cv2.VideoCapture(0)
         ret, frame = cap.read()
         if ret:
-            frame = cv2.resize(frame, (320, 240))
-            frame, msg = detect_and_navigate(frame)
-            cv2.putText(frame, msg, (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.imshow("AI Assistant", frame)
-            cv2.waitKey(5000)
-        cap.stop()
-
-    elif mode == "switch":
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.resize(frame, (320, 240))
-            frame, msg = detect_and_navigate(frame)
-            cv2.putText(frame, msg, (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.imshow("AI Assistant", frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        cap.stop()
-
-    cv2.destroyAllWindows()
+            help_mode(frame)
+        cap.release()
+    else:
+        switch_mode()
 
 if __name__ == "__main__":
     main()
