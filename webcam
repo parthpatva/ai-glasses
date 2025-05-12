@@ -1,28 +1,54 @@
 import cv2
 import pyttsx3
-import speech_recognition as sr
 import threading
 import time
+import speech_recognition as sr
 from ultralytics import YOLO
-import numpy as np
+import tempfile
+import subprocess
+import os
 
-# Load YOLOv8n model
+# Load YOLO model
 model = YOLO("yolov8n.pt")
 
-# Initialize TTS
+# Initialize Text-to-Speech
 engine = pyttsx3.init()
 engine.setProperty("rate", 170)
 
-LANGUAGE = 'en'
-MODE = 'help'
+def speak(text):
+    print("AI:", text)
+    engine.say(text)
+    engine.runAndWait()
 
-# Threaded video capture
+# Record and recognize speech without PyAudio
+def listen_command(prompt_text="Say command"):
+    speak(prompt_text)
+    print("Recording for 4 seconds...")
+
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        audio_path = f.name
+
+    subprocess.run(['arecord', '-D', 'plughw:1', '-f', 'cd', '-t', 'wav', '-d', '4', '-r', '16000', audio_path])
+
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_path) as source:
+        audio_data = recognizer.record(source)
+        try:
+            command = recognizer.recognize_google(audio_data).lower()
+            print("Recognized:", command)
+            return command
+        except sr.UnknownValueError:
+            speak("Sorry, I didn't catch that.")
+        except sr.RequestError:
+            speak("Speech recognition service failed.")
+    return ""
+
 class VideoCaptureThread:
-    def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src)
+    def __init__(self, source=0):
+        self.cap = cv2.VideoCapture(source)
         self.ret, self.frame = self.cap.read()
         self.running = True
-        self.thread = threading.Thread(target=self.update)
+        self.thread = threading.Thread(target=self.update, args=())
         self.thread.start()
 
     def update(self):
@@ -37,151 +63,97 @@ class VideoCaptureThread:
         self.thread.join()
         self.cap.release()
 
-# TTS function
-def speak(text):
-    print("🗣️", text)
-    engine.say(text)
-    engine.runAndWait()
-
-# Listen function using speech_recognition (no PyAudio)
-def listen_command(prompt_text="Say command"):
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        speak(prompt_text)
-        print("Listening...")
-        try:
-            audio = recognizer.listen(source, timeout=5)
-            command = recognizer.recognize_google(audio).lower()
-            print("You said:", command)
-            return command
-        except sr.UnknownValueError:
-            speak("Sorry, I didn't understand.")
-            return ""
-        except sr.RequestError:
-            speak("Speech service error.")
-            return ""
-        except sr.WaitTimeoutError:
-            speak("Listening timed out.")
-            return ""
-
-# Navigation logic
-def get_navigation(detected_objects, frame_width):
-    left_count = sum(1 for obj in detected_objects if obj[2] < frame_width // 3)
-    right_count = sum(1 for obj in detected_objects if obj[3] > 2 * (frame_width // 3))
-
-    if left_count == 0 and right_count == 0 and detected_objects:
-        return "Move forward."
-    elif left_count > right_count:
-        return "Obstacle on the left. Move right."
-    elif right_count > left_count:
-        return "Obstacle on the right. Move left."
-    elif detected_objects:
-        return "Obstacle ahead. Stop."
-    return "Path clear. Move forward."
-
 # Object detection
+
 def detect_objects(frame):
-    results = model(frame, verbose=False)[0]
-    detected = []
+    results = model(frame, verbose=False)
+    detected_objects = []
 
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        class_id = int(box.cls[0])
-        label = model.names[class_id]
-        detected.append((label, x1, x2))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    for result in results:
+        for box in result.boxes[:3]:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            class_id = int(box.cls[0])
+            label = model.names[class_id]
+            detected_objects.append((label, x1, x2))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    return frame, detected
+    return frame, detected_objects
 
-# One-time help
-def help_mode(frame):
-    frame = cv2.resize(frame, (320, 240))
-    frame, detected_objects = detect_objects(frame)
-    nav_msg = get_navigation(detected_objects, frame.shape[1])
+# Navigation instructions
 
-    if LANGUAGE == 'hi':
-        translations = {
-            "Obstacle on the left. Move right.": "बाईं ओर बाधा है। दाईं ओर जाएं।",
-            "Obstacle on the right. Move left.": "दाईं ओर बाधा है। बाईं ओर जाएं।",
-            "Obstacle ahead. Stop.": "आगे बाधा है। रुक जाओ।",
-            "Path clear. Move forward.": "रास्ता साफ है। आगे बढ़ें।",
-            "Move forward.": "आगे बढ़ें।"
-        }
-        nav_msg = translations.get(nav_msg, "रास्ता साफ है।")
+def get_navigation(detected_objects, width, language):
+    left = sum(1 for obj in detected_objects if obj[1] < width // 3)
+    right = sum(1 for obj in detected_objects if obj[2] > 2 * (width // 3))
+    center = len(detected_objects) - left - right
 
-    speak(nav_msg)
-    cv2.imshow("Help Frame", frame)
-    cv2.waitKey(2000)
-    cv2.destroyWindow("Help Frame")
+    if center:
+        return "Stop! Object ahead." if language == 'english' else "Rukiye! Aage badhaav hai."
+    elif left > right:
+        return "Move right." if language == 'english' else "Daiyen chaliye."
+    elif right > left:
+        return "Move left." if language == 'english' else "Baayen chaliye."
+    else:
+        return "Path is clear." if language == 'english' else "Raasta saaf hai."
 
-# Continuous switch mode
-def switch_mode():
-    video_stream = VideoCaptureThread(0)
-    last_spoken = ""
+def help_mode(language):
+    video = VideoCaptureThread(0)
+    time.sleep(1)
+    ret, frame = video.read()
+    if ret:
+        frame = cv2.resize(frame, (320, 240))
+        frame, detected_objects = detect_objects(frame)
+        nav_msg = get_navigation(detected_objects, frame.shape[1], language)
+        speak(nav_msg)
+        cv2.imshow("Help Mode", frame)
+        cv2.waitKey(2000)
+        cv2.destroyAllWindows()
+    video.stop()
+
+def switch_mode(language):
+    video = VideoCaptureThread(0)
+    last_message = ""
     while True:
-        ret, frame = video_stream.read()
+        ret, frame = video.read()
         if not ret:
             break
 
         frame = cv2.resize(frame, (320, 240))
         frame, detected_objects = detect_objects(frame)
-        nav_msg = get_navigation(detected_objects, frame.shape[1])
+        nav_msg = get_navigation(detected_objects, frame.shape[1], language)
 
-        if nav_msg != last_spoken:
-            last_spoken = nav_msg
-            if LANGUAGE == 'hi':
-                translations = {
-                    "Obstacle on the left. Move right.": "बाईं ओर बाधा है। दाईं ओर जाएं।",
-                    "Obstacle on the right. Move left.": "दाईं ओर बाधा है। बाईं ओर जाएं।",
-                    "Obstacle ahead. Stop.": "आगे बाधा है। रुक जाओ।",
-                    "Path clear. Move forward.": "रास्ता साफ है। आगे बढ़ें।",
-                    "Move forward.": "आगे बढ़ें।"
-                }
-                nav_msg = translations.get(nav_msg, "रास्ता साफ है।")
-
-            threading.Thread(target=speak, args=(nav_msg,)).start()
+        if nav_msg != last_message:
+            last_message = nav_msg
+            speak(nav_msg)
 
         cv2.imshow("Switch Mode", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    video_stream.stop()
+    video.stop()
     cv2.destroyAllWindows()
 
-# Main logic
 def main():
-    global LANGUAGE, MODE
+    speak("Hey, it's your AI guiding you to your path.")
 
-    # 1. Language Selection
+    # Language selection
     lang_input = listen_command("Please say English or Hindi to choose your language.")
-    LANGUAGE = 'hi' if "hindi" in lang_input else 'en'
-    speak("You selected Hindi." if LANGUAGE == 'hi' else "You selected English.")
-    speak("Hey! It's your AI guiding you to your path.")
+    language = 'english' if 'english' in lang_input else 'hindi'
+    speak("Language set to English." if language == 'english' else "Bhasha Hindi chuni gayi hai.")
 
-    # Loop for help/switch selection
     while True:
-        mode_input = listen_command("Please say help or switch to choose your mode.")
-        MODE = 'help' if "help" in mode_input else 'switch'
-        speak("Help mode activated." if MODE == 'help' else "Switch mode activated.")
-
-        if MODE == 'help':
-            cap = cv2.VideoCapture(0)
-            ret, frame = cap.read()
-            if ret:
-                help_mode(frame)
-            cap.release()
-
-            follow_up = listen_command("Do you want to continue? Say yes or no.")
-            if "yes" in follow_up:
-                continue  # Re-ask mode
-            else:
-                speak("Repeating help mode.")
+        mode_input = listen_command("Say help or switch to select the mode.")
+        if 'help' in mode_input:
+            speak("You selected help mode." if language == 'english' else "Aapne madad mode chuna hai.")
+            help_mode(language)
+            again = listen_command("Do you want help again? Say yes or no." if language == 'english' else "Kya aap fir se madad chahte hain? Haan ya na kahiye.")
+            if 'no' in again:
                 continue
+        elif 'switch' in mode_input:
+            speak("You selected switch mode." if language == 'english' else "Aapne dynamic mode chuna hai.")
+            switch_mode(language)
         else:
-            switch_mode()
-            break
+            speak("Could not understand mode. Please say help or switch." if language == 'english' else "Kripya help ya switch kahiye.")
 
 if __name__ == "__main__":
     main()
