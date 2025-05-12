@@ -8,35 +8,25 @@ import threading
 import time
 from ultralytics import YOLO
 
-# Initialize YOLO model
+# Initialize model and TTS engine
 model = YOLO("yolov8n.pt")
-
-# Initialize TTS engine
 engine = pyttsx3.init()
 engine.setProperty("rate", 170)
 
-# Language configuration
 LANGUAGE = 'en'
-MODE = 'switch'
 
-# Voice speaking
 def speak(text):
     print("SPEAK:", text)
     engine.say(text)
     engine.runAndWait()
 
-# Listen to command via microphone without pyaudio
 def listen_command(prompt="Say something"):
     speak(prompt)
-    print(prompt)
-
     fs = 16000
     duration = 4
-
     try:
         recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
         sd.wait()
-
         wav.write("temp.wav", fs, recording)
 
         recognizer = sr.Recognizer()
@@ -50,7 +40,6 @@ def listen_command(prompt="Say something"):
         print(f"Voice recognition failed: {e}")
         return input("Voice failed, type instead: ").lower()
 
-# Video capture thread
 class VideoCaptureThread:
     def __init__(self, source=0):
         self.cap = cv2.VideoCapture(source)
@@ -71,11 +60,9 @@ class VideoCaptureThread:
         self.thread.join()
         self.cap.release()
 
-# Object detection logic
 def detect_objects(frame):
     results = model(frame, verbose=False)
     detected = []
-
     for result in results:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -87,7 +74,6 @@ def detect_objects(frame):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return frame, detected
 
-# Navigation logic
 def get_navigation(objects, frame_width):
     left = sum(1 for o in objects if o[1] < frame_width // 3)
     right = sum(1 for o in objects if o[2] > 2 * (frame_width // 3))
@@ -109,25 +95,41 @@ def get_navigation(objects, frame_width):
         return ("Obstacle in all directions. Please stop.",
                 "हर दिशा में बाधा है। कृपया रुकें।")
 
-# Help mode: capture and give one-time guidance
-def help_mode(frame):
+def help_mode():
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    if not ret:
+        speak("Camera not available.")
+        cap.release()
+        return
+
     frame = cv2.resize(frame, (320, 240))
     frame, detected = detect_objects(frame)
     nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
-    speak(nav_eng if LANGUAGE == 'en' else nav_hin)
-    cv2.putText(frame, nav_eng if LANGUAGE == 'en' else nav_hin, (5, 20),
+    message = nav_eng if LANGUAGE == 'en' else nav_hin
+
+    speak(message)
+    cv2.putText(frame, message, (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     cv2.imshow("AI Glasses - Help Mode", frame)
-    cv2.waitKey(5000)
+    cv2.waitKey(4000)
     cv2.destroyWindow("AI Glasses - Help Mode")
+    cap.release()
 
-# Dynamic switch mode
+    feedback = listen_command("Did that help? Say yes or no.")
+    if "yes" in feedback:
+        next_mode()
+    else:
+        help_mode()
+
 def switch_mode():
     stream = VideoCaptureThread()
     last_spoken = ""
+    speak("Switch mode activated. Navigation started.")
     while True:
         ret, frame = stream.read()
         if not ret:
+            speak("Camera error.")
             break
 
         frame = cv2.resize(frame, (320, 240))
@@ -143,40 +145,39 @@ def switch_mode():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         cv2.imshow("AI Glasses - Switch Mode", frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1)
+        if key & 0xFF == ord('q'):
+            break
+        elif key & 0xFF == ord('h'):  # hotkey to switch to help mode
             break
 
     stream.stop()
     cv2.destroyAllWindows()
+    next_mode()
 
-# Main program
+def next_mode():
+    speak("Would you like help or switch mode?")
+    user_mode = listen_command("Say help or switch.")
+    if "help" in user_mode:
+        help_mode()
+    elif "switch" in user_mode:
+        switch_mode()
+    else:
+        speak("Didn't catch that. Defaulting to switch mode.")
+        switch_mode()
+
 def main():
-    global LANGUAGE, MODE
-
+    global LANGUAGE
     lang_input = listen_command("Please say English or Hindi to choose your language.")
     if "hindi" in lang_input:
         LANGUAGE = 'hi'
+        speak("आपने हिंदी चुनी है।")
     else:
         LANGUAGE = 'en'
-    speak("You selected Hindi." if LANGUAGE == 'hi' else "You selected English.")
+        speak("You selected English.")
 
-    mode_input = listen_command("Please say help or switch to choose your mode.")
-    if "help" in mode_input:
-        MODE = 'help'
-    else:
-        MODE = 'switch'
-    speak("Help mode activated." if MODE == 'help' else "Switch mode activated.")
-
-    # Start guidance
     speak("Hey! It's your AI guiding you to your path.")
-    if MODE == 'help':
-        cap = cv2.VideoCapture(0)
-        ret, frame = cap.read()
-        if ret:
-            help_mode(frame)
-        cap.release()
-    else:
-        switch_mode()
+    next_mode()
 
 if __name__ == "__main__":
     main()
