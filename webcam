@@ -21,24 +21,27 @@ def speak(text):
     engine.runAndWait()
 
 def listen_command(prompt="Say something"):
-    speak(prompt)
     fs = 16000
     duration = 4
-    try:
-        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
-        sd.wait()
-        wav.write("temp.wav", fs, recording)
+    recognizer = sr.Recognizer()
 
-        recognizer = sr.Recognizer()
-        with sr.AudioFile("temp.wav") as source:
-            audio = recognizer.record(source)
+    while True:
+        speak(prompt)
+        print(prompt)
+        try:
+            recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
+            sd.wait()
+            wav.write("temp.wav", fs, recording)
 
-        command = recognizer.recognize_google(audio).lower()
-        print(f"RECOGNIZED: {command}")
-        return command
-    except Exception as e:
-        print(f"Voice recognition failed: {e}")
-        return input("Voice failed, type instead: ").lower()
+            with sr.AudioFile("temp.wav") as source:
+                audio = recognizer.record(source)
+
+            command = recognizer.recognize_google(audio).lower()
+            print(f"RECOGNIZED: {command}")
+            return command
+        except Exception as e:
+            print(f"Voice recognition failed: {e}")
+            speak("I didn't catch that. Please try again.")
 
 class VideoCaptureThread:
     def __init__(self, source=0):
@@ -99,7 +102,7 @@ def help_mode():
     cap = cv2.VideoCapture(0)
     ret, frame = cap.read()
     if not ret:
-        speak("Camera not available.")
+        speak("Camera not accessible.")
         cap.release()
         return
 
@@ -112,20 +115,28 @@ def help_mode():
     cv2.putText(frame, message, (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     cv2.imshow("AI Glasses - Help Mode", frame)
-    cv2.waitKey(4000)
+    cv2.waitKey(5000)
     cv2.destroyWindow("AI Glasses - Help Mode")
     cap.release()
 
-    feedback = listen_command("Did that help? Say yes or no.")
-    if "yes" in feedback:
-        next_mode()
-    else:
-        help_mode()
+    # Ask if it helped
+    while True:
+        response = listen_command("Did that help you? Say yes or no.")
+        if "yes" in response:
+            ask_mode()
+            break
+        elif "no" in response:
+            speak("Repeating help...")
+            help_mode()
+            break
+        else:
+            speak("Please say yes or no.")
 
 def switch_mode():
     stream = VideoCaptureThread()
     last_spoken = ""
-    speak("Switch mode activated. Navigation started.")
+    speak("Switch mode started. Say quit to stop anytime.")
+
     while True:
         ret, frame = stream.read()
         if not ret:
@@ -135,49 +146,48 @@ def switch_mode():
         frame = cv2.resize(frame, (320, 240))
         frame, detected = detect_objects(frame)
         nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
-        text_to_speak = nav_eng if LANGUAGE == 'en' else nav_hin
+        message = nav_eng if LANGUAGE == 'en' else nav_hin
 
-        if text_to_speak != last_spoken:
-            last_spoken = text_to_speak
-            threading.Thread(target=speak, args=(text_to_speak,)).start()
+        if message != last_spoken:
+            last_spoken = message
+            threading.Thread(target=speak, args=(message,)).start()
 
-        cv2.putText(frame, text_to_speak, (5, 20),
+        cv2.putText(frame, message, (5, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         cv2.imshow("AI Glasses - Switch Mode", frame)
 
-        key = cv2.waitKey(1)
-        if key & 0xFF == ord('q'):
-            break
-        elif key & 0xFF == ord('h'):  # hotkey to switch to help mode
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     stream.stop()
     cv2.destroyAllWindows()
-    next_mode()
+    ask_mode()
 
-def next_mode():
-    speak("Would you like help or switch mode?")
-    user_mode = listen_command("Say help or switch.")
-    if "help" in user_mode:
+def ask_mode():
+    global LANGUAGE
+    mode_input = listen_command("Say help or switch to choose your mode.")
+    if "help" in mode_input:
+        speak("Help mode activated.")
         help_mode()
-    elif "switch" in user_mode:
+    elif "switch" in mode_input:
+        speak("Switch mode activated.")
         switch_mode()
     else:
-        speak("Didn't catch that. Defaulting to switch mode.")
-        switch_mode()
+        speak("I didn't understand. Please say help or switch.")
+        ask_mode()
 
 def main():
     global LANGUAGE
+    speak("Hey! It's your AI guiding you to your path.")
+
     lang_input = listen_command("Please say English or Hindi to choose your language.")
     if "hindi" in lang_input:
         LANGUAGE = 'hi'
-        speak("आपने हिंदी चुनी है।")
     else:
         LANGUAGE = 'en'
-        speak("You selected English.")
 
-    speak("Hey! It's your AI guiding you to your path.")
-    next_mode()
+    speak("You selected Hindi." if LANGUAGE == 'hi' else "You selected English.")
+    ask_mode()
 
 if __name__ == "__main__":
     main()
