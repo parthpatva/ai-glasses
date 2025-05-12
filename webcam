@@ -1,59 +1,25 @@
 import cv2
 import pyttsx3
 import speech_recognition as sr
-import sounddevice as sd
-import numpy as np
-import scipy.io.wavfile as wav
 import threading
 import time
 from ultralytics import YOLO
+import numpy as np
 
-# Initialize YOLO model
+# Load YOLOv8n model
 model = YOLO("yolov8n.pt")
 
-# Initialize TTS engine
+# Initialize TTS
 engine = pyttsx3.init()
 engine.setProperty("rate", 170)
 
-# Language configuration
 LANGUAGE = 'en'
-MODE = 'switch'
+MODE = 'help'
 
-# Voice speaking
-def speak(text):
-    print("SPEAK:", text)
-    engine.say(text)
-    engine.runAndWait()
-
-# Listen to command via microphone without pyaudio
-def listen_command(prompt="Say something"):
-    speak(prompt)
-    print(prompt)
-
-    fs = 16000
-    duration = 4
-
-    try:
-        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
-        sd.wait()
-
-        wav.write("temp.wav", fs, recording)
-
-        recognizer = sr.Recognizer()
-        with sr.AudioFile("temp.wav") as source:
-            audio = recognizer.record(source)
-
-        command = recognizer.recognize_google(audio).lower()
-        print(f"RECOGNIZED: {command}")
-        return command
-    except Exception as e:
-        print(f"Voice recognition failed: {e}")
-        return input("Voice failed, type instead: ").lower()
-
-# Video capture thread
+# Threaded video capture
 class VideoCaptureThread:
-    def __init__(self, source=0):
-        self.cap = cv2.VideoCapture(source)
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
         self.ret, self.frame = self.cap.read()
         self.running = True
         self.thread = threading.Thread(target=self.update)
@@ -71,112 +37,151 @@ class VideoCaptureThread:
         self.thread.join()
         self.cap.release()
 
-# Object detection logic
-def detect_objects(frame):
-    results = model(frame, verbose=False)
-    detected = []
+# TTS function
+def speak(text):
+    print("🗣️", text)
+    engine.say(text)
+    engine.runAndWait()
 
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            class_id = int(box.cls[0])
-            label = model.names[class_id]
-            detected.append((label, x1, x2))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    return frame, detected
+# Listen function using speech_recognition (no PyAudio)
+def listen_command(prompt_text="Say command"):
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        speak(prompt_text)
+        print("Listening...")
+        try:
+            audio = recognizer.listen(source, timeout=5)
+            command = recognizer.recognize_google(audio).lower()
+            print("You said:", command)
+            return command
+        except sr.UnknownValueError:
+            speak("Sorry, I didn't understand.")
+            return ""
+        except sr.RequestError:
+            speak("Speech service error.")
+            return ""
+        except sr.WaitTimeoutError:
+            speak("Listening timed out.")
+            return ""
 
 # Navigation logic
-def get_navigation(objects, frame_width):
-    left = sum(1 for o in objects if o[1] < frame_width // 3)
-    right = sum(1 for o in objects if o[2] > 2 * (frame_width // 3))
-    center = sum(1 for o in objects if frame_width // 3 <= o[1] <= 2 * (frame_width // 3))
+def get_navigation(detected_objects, frame_width):
+    left_count = sum(1 for obj in detected_objects if obj[2] < frame_width // 3)
+    right_count = sum(1 for obj in detected_objects if obj[3] > 2 * (frame_width // 3))
 
-    if left == 0 and right == 0 and center == 0:
-        return ("Path is clear. Move forward.",
-                "रास्ता साफ है। आगे बढ़ें।")
-    elif center > 0 and left == 0 and right == 0:
-        return ("Obstacle ahead. Please stop.",
-                "सामने बाधा है। कृपया रुकें।")
-    elif left == 0:
-        return ("Obstacle on right. Move left.",
-                "दाईं ओर बाधा है। बाईं ओर जाएं।")
-    elif right == 0:
-        return ("Obstacle on left. Move right.",
-                "बाईं ओर बाधा है। दाईं ओर जाएं।")
-    else:
-        return ("Obstacle in all directions. Please stop.",
-                "हर दिशा में बाधा है। कृपया रुकें।")
+    if left_count == 0 and right_count == 0 and detected_objects:
+        return "Move forward."
+    elif left_count > right_count:
+        return "Obstacle on the left. Move right."
+    elif right_count > left_count:
+        return "Obstacle on the right. Move left."
+    elif detected_objects:
+        return "Obstacle ahead. Stop."
+    return "Path clear. Move forward."
 
-# Help mode: capture and give one-time guidance
+# Object detection
+def detect_objects(frame):
+    results = model(frame, verbose=False)[0]
+    detected = []
+
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        class_id = int(box.cls[0])
+        label = model.names[class_id]
+        detected.append((label, x1, x2))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    return frame, detected
+
+# One-time help
 def help_mode(frame):
     frame = cv2.resize(frame, (320, 240))
-    frame, detected = detect_objects(frame)
-    nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
-    speak(nav_eng if LANGUAGE == 'en' else nav_hin)
-    cv2.putText(frame, nav_eng if LANGUAGE == 'en' else nav_hin, (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-    cv2.imshow("AI Glasses - Help Mode", frame)
-    cv2.waitKey(5000)
-    cv2.destroyWindow("AI Glasses - Help Mode")
+    frame, detected_objects = detect_objects(frame)
+    nav_msg = get_navigation(detected_objects, frame.shape[1])
 
-# Dynamic switch mode
+    if LANGUAGE == 'hi':
+        translations = {
+            "Obstacle on the left. Move right.": "बाईं ओर बाधा है। दाईं ओर जाएं।",
+            "Obstacle on the right. Move left.": "दाईं ओर बाधा है। बाईं ओर जाएं।",
+            "Obstacle ahead. Stop.": "आगे बाधा है। रुक जाओ।",
+            "Path clear. Move forward.": "रास्ता साफ है। आगे बढ़ें।",
+            "Move forward.": "आगे बढ़ें।"
+        }
+        nav_msg = translations.get(nav_msg, "रास्ता साफ है।")
+
+    speak(nav_msg)
+    cv2.imshow("Help Frame", frame)
+    cv2.waitKey(2000)
+    cv2.destroyWindow("Help Frame")
+
+# Continuous switch mode
 def switch_mode():
-    stream = VideoCaptureThread()
+    video_stream = VideoCaptureThread(0)
     last_spoken = ""
     while True:
-        ret, frame = stream.read()
+        ret, frame = video_stream.read()
         if not ret:
             break
 
         frame = cv2.resize(frame, (320, 240))
-        frame, detected = detect_objects(frame)
-        nav_eng, nav_hin = get_navigation(detected, frame.shape[1])
-        text_to_speak = nav_eng if LANGUAGE == 'en' else nav_hin
+        frame, detected_objects = detect_objects(frame)
+        nav_msg = get_navigation(detected_objects, frame.shape[1])
 
-        if text_to_speak != last_spoken:
-            last_spoken = text_to_speak
-            threading.Thread(target=speak, args=(text_to_speak,)).start()
+        if nav_msg != last_spoken:
+            last_spoken = nav_msg
+            if LANGUAGE == 'hi':
+                translations = {
+                    "Obstacle on the left. Move right.": "बाईं ओर बाधा है। दाईं ओर जाएं।",
+                    "Obstacle on the right. Move left.": "दाईं ओर बाधा है। बाईं ओर जाएं।",
+                    "Obstacle ahead. Stop.": "आगे बाधा है। रुक जाओ।",
+                    "Path clear. Move forward.": "रास्ता साफ है। आगे बढ़ें।",
+                    "Move forward.": "आगे बढ़ें।"
+                }
+                nav_msg = translations.get(nav_msg, "रास्ता साफ है।")
 
-        cv2.putText(frame, text_to_speak, (5, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-        cv2.imshow("AI Glasses - Switch Mode", frame)
+            threading.Thread(target=speak, args=(nav_msg,)).start()
 
+        cv2.imshow("Switch Mode", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    stream.stop()
+    video_stream.stop()
     cv2.destroyAllWindows()
 
-# Main program
+# Main logic
 def main():
     global LANGUAGE, MODE
 
+    # 1. Language Selection
     lang_input = listen_command("Please say English or Hindi to choose your language.")
-    if "hindi" in lang_input:
-        LANGUAGE = 'hi'
-    else:
-        LANGUAGE = 'en'
+    LANGUAGE = 'hi' if "hindi" in lang_input else 'en'
     speak("You selected Hindi." if LANGUAGE == 'hi' else "You selected English.")
-
-    mode_input = listen_command("Please say help or switch to choose your mode.")
-    if "help" in mode_input:
-        MODE = 'help'
-    else:
-        MODE = 'switch'
-    speak("Help mode activated." if MODE == 'help' else "Switch mode activated.")
-
-    # Start guidance
     speak("Hey! It's your AI guiding you to your path.")
-    if MODE == 'help':
-        cap = cv2.VideoCapture(0)
-        ret, frame = cap.read()
-        if ret:
-            help_mode(frame)
-        cap.release()
-    else:
-        switch_mode()
+
+    # Loop for help/switch selection
+    while True:
+        mode_input = listen_command("Please say help or switch to choose your mode.")
+        MODE = 'help' if "help" in mode_input else 'switch'
+        speak("Help mode activated." if MODE == 'help' else "Switch mode activated.")
+
+        if MODE == 'help':
+            cap = cv2.VideoCapture(0)
+            ret, frame = cap.read()
+            if ret:
+                help_mode(frame)
+            cap.release()
+
+            follow_up = listen_command("Do you want to continue? Say yes or no.")
+            if "yes" in follow_up:
+                continue  # Re-ask mode
+            else:
+                speak("Repeating help mode.")
+                continue
+        else:
+            switch_mode()
+            break
 
 if __name__ == "__main__":
     main()
